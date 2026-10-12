@@ -81,8 +81,11 @@ a stroke in progress streams as a preview that never reaches the database;
 a note is readable by its own hand and nobody else, through any route; the
 page ships no third-party script or tracking request; every hand colour
 reads at WCAG 1.4.11's 3:1 non-text contrast minimum against both a white
-and a black background. An old database, made before any of this, opens
-with every mark intact (`spec/migration.test.ts`).
+and a black background; a stroke's samples are refused unless they match
+its path point for point, with pressure between 0 and 1 and time starting
+at zero and never running backwards. An old database, made before any of
+this, opens with every mark intact and drawn exactly as before
+(`spec/migration.test.ts`).
 
 Whether the wall is good to look at, whether a daily prompt makes people
 draw more thoughtfully or just more often, and whether private notes are
@@ -108,6 +111,42 @@ can tell whose is whose. `spec/wall.test.ts` checks both halves: the hand
 that drew a mark sees it marked as theirs, and a different hand looking at
 the same wall doesn't.
 
+## How a stroke is recorded
+
+A mark used to remember only where its line went. Now it also keeps how
+the line was drawn: for every point, the pressure the input reported and
+the milliseconds since the stroke began. These samples sit beside the path
+(`[x, y, pressure, t]`, one per point, as JSON in the mark's own row),
+stream with a live preview exactly as the finished mark will store them,
+and come back out in `/api/marks`, the `mark` event and your export, along
+with where the stroke started and ended.
+
+They're used for one thing: width. A pen that presses harder draws
+thicker, so a stroke now tapers where its hand eased off. The rule, in
+`public/ink.js`, which the browser and the server both run so the stroke
+under your pointer is the one everyone else sees, is deliberately plain.
+A stroke's lightest point draws at the same width every stroke always
+has, and each point pressed harder than that adds width in proportion to
+the difference. Pressure is never stretched to fill a range: a pen held
+steady stays steady, rather than having its noise blown up into a taper
+it never had.
+
+Most people won't see any of this. A mouse reports the same pressure the
+whole time its button is down, and so do most touchscreens, so their
+strokes draw exactly as before. Trace still records that flat line, since
+it's the honest record that no real pressure was there; a keyboard reports
+none at all, so its samples say `null` rather than a made-up value. Marks
+drawn before samples existed keep an empty column, not invented ones, and
+render as they always did. I tested the varying width with synthetic pen
+events in a real browser, not on a pressure-sensitive pen.
+
+Timing is kept relative to the stroke's own first point, never as a clock
+time, and nothing here reads anything into it. How fast a line was drawn
+might say something about the person drawing it, or it might say they
+were on a train; Trace doesn't guess. The samples also add no new way to
+tell whose marks are whose: they ride on the same row as the path, and the
+hand that drew it stays on the server.
+
 ## What's real-time, and why
 
 Two things happen live on the wall, both over one same-origin
@@ -127,7 +166,7 @@ gesture, and the server fans them out as `preview` events, with a
 is written to the database. The server takes the colour and ownership from
 the hand cookie, not from the request, refuses previews from a hand that
 can't add a mark right now, and bounds everything: 200 points an update,
-2,001 a stroke, 30 updates a second per hand, 100 strokes at once, 8 KB a
+2,001 a stroke, 30 updates a second per hand, 100 strokes at once, 16 KB a
 request, integer coordinates near the wall. SSE still fits: the only thing
 a drawing tab sends is a short burst of small POSTs, and the server keeps
 the one-way stream it already had, so there was no need for WebSockets.
@@ -198,7 +237,8 @@ with tabs open, restarting it, and adding a mark before the tab had
 reconnected: the tab caught up with no reload.
 
 Rolling back to the previous version is safe: it reads the same `marks`
-table and ignores the new columns and the `notes` table. Deleted marks
+table and ignores the new columns (samples included, so pen strokes go
+back to an even width) and the `notes` table. Deleted marks
 would come back as empty paths (invisible), and notes would sit unread
 until the new version returned.
 
