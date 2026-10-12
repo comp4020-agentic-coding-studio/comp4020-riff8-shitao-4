@@ -467,7 +467,7 @@ it("bounds preview payloads and rejects bad coordinates", async () => {
   for (const body of bad) {
     expect((await previewUpdate(hand.cookie, body)).status).toBe(400);
   }
-  // Over the 8 KB body cap: refused outright, never parsed.
+  // Over the 16 KB body cap: refused outright, never parsed.
   const huge = { gesture: randomUUID(), from: 0, points: [[1, 1]], pad: "x".repeat(20_000) };
   const res = await previewUpdate(hand.cookie, huge).catch(() => undefined);
   expect(res === undefined || res.status === 400).toBe(true);
@@ -640,4 +640,143 @@ it("a note too long to accept is refused, not taken as a blank note that deletes
   }).catch(() => undefined);
   expect(tooLong === undefined || tooLong.status === 413 || tooLong.status === 404).toBe(true);
   expect(await minePage(hand.cookie)).toContain("字".repeat(500));
+});
+
+// --- Samples: how a stroke was drawn, point by point ---------------------------
+
+// A stroke's samples, one [x, y, pressure, t] per point of its path, unique
+// per run since the app keeps its database between runs.
+const sampledStroke = (pressure: (i: number) => number | null, n = 12) => {
+  const x0 = 100 + (Date.now() % 700);
+  const samples = Array.from({ length: n }, (_, i) => [x0 + i * 5, 200 + i * 3, pressure(i), i * 16]);
+  const path = samples.map(([x, y], i) => `${i === 0 ? "M" : "L"}${x},${y}`).join(" ");
+  return { samples, path };
+};
+
+const wallPaths = async (cookie: string) =>
+  [...new JSDOM(await (await fetch(new URL("/", baseUrl), { headers: { Cookie: cookie } })).text()).window.document.querySelectorAll("#wall path")];
+
+// The outline's width at its widest and narrowest sample: the distance
+// between the two sides, which ink.js builds as n left points then n right
+// points (in reverse) around two cap arcs.
+const outlineWidths = (d: string, n: number) => {
+  const pts = [...d.matchAll(/(?:[ML]|0 0 0 )(-?[\d.]+),(-?[\d.]+)/g)].map((m) => [Number(m[1]), Number(m[2])]);
+  const [left, right] = [pts.slice(0, n), pts.slice(n, 2 * n).reverse()];
+  return left.map(([x, y], i) => Math.hypot(x - right[i][0], y - right[i][1]));
+};
+
+it("keeps a pen stroke's samples, and draws it wider where it was pressed harder", async () => {
+  const stream = await openStream();
+  const drawer = await freshHand();
+  const viewer = await freshHand();
+  const { samples, path } = sampledStroke((i) => 0.1 + i * 0.07);
+  const post = await postMark(drawer.cookie, { path, samples });
+  expect(post.status).toBe(201);
+  const { id } = await post.json();
+
+  // Stored exactly as drawn, and published with where it began and ended.
+  const event = await stream.next("mark", (d) => d.id === id);
+  const listed = ((await (await fetch(new URL("/api/marks", baseUrl))).json()) as any[]).find((m) => m.id === id);
+  for (const m of [event, listed]) {
+    expect(m.samples).toEqual(samples);
+    expect(m.start).toEqual(samples[0].slice(0, 2));
+    expect(m.end).toEqual(samples.at(-1)!.slice(0, 2));
+    expect(m).not.toHaveProperty("hand_id");
+  }
+  expect(JSON.stringify(stream.seen)).not.toContain(drawer.cookie.split("=")[1]);
+
+  // Every viewer's wall draws it as a filled outline that widens with the
+  // pressure: nothing at its lightest point, 12 × 0.77 more at its heaviest.
+  const el = (await wallPaths(viewer.cookie)).find((p) => p.getAttribute("data-id") === String(id))!;
+  expect(el.getAttribute("class")).toBe("inked");
+  expect(el.getAttribute("fill")).toBe(drawer.colour);
+  const widths = outlineWidths(el.getAttribute("d")!, samples.length);
+  expect(widths[0]).toBeCloseTo(0, 0);
+  expect(widths.at(-1)).toBeCloseTo(12 * 0.77, 0);
+  expect(widths.every((w, i) => i === 0 || w > widths[i - 1])).toBe(true);
+  stream.close();
+});
+
+it("draws a mouse or finger stroke, with its one constant pressure, exactly as before", async () => {
+  const drawer = await freshHand();
+  const { samples, path } = sampledStroke(() => 0.5);
+  const post = await postMark(drawer.cookie, { path, samples });
+  expect(post.status).toBe(201);
+  const { id } = await post.json();
+  const els = (await wallPaths(drawer.cookie)).filter((p) => p.getAttribute("data-id") === String(id));
+  // Its halo and its stroke: the plain path, no outline, no fill.
+  expect(els.map((p) => [p.getAttribute("d"), p.getAttribute("class"), p.getAttribute("fill")])).toEqual([
+    [path, "halo", null],
+    [path, "mine", null],
+  ]);
+  // And the flat line is kept, not tidied away: that's the honest record.
+  const own = await (await fetch(new URL("/mine/export.json", baseUrl), { headers: { Cookie: drawer.cookie } })).json();
+  expect(own.marks[0]).toMatchObject({ path, samples, start: samples[0].slice(0, 2), end: samples.at(-1)!.slice(0, 2) });
+});
+
+it("refuses samples out of range, out of order or not matching the path, without spending the day", async () => {
+  const hand = await freshHand();
+  const { samples, path } = sampledStroke(() => 0.5);
+  const tweak = (i: number, field: number, value: unknown) =>
+    samples.map((s, j) => (j === i ? s.map((v, k) => (k === field ? value : v)) : s));
+  const bad = [
+    tweak(3, 2, 1.5), // pressure over 1
+    tweak(3, 2, -0.1), // pressure under 0
+    tweak(3, 2, "0.5"), // pressure not a number
+    tweak(0, 3, 5), // the first sample isn't t = 0
+    tweak(5, 3, 1), // time runs backwards
+    tweak(5, 3, -16), // negative time
+    tweak(11, 3, 11 * 60 * 1000), // longer than any gesture can last
+    tweak(4, 3, 64.5), // fractional milliseconds
+    tweak(4, 0, samples[4][0]! + 1), // not where the path went
+    samples.slice(1), // one fewer than the path's points
+    [...samples, [1, 1, 0.5, 999]], // one more
+    samples.map((s) => s.slice(0, 3)), // no timestamp
+    "not a list",
+  ];
+  for (const body of bad) {
+    const res = await postMark(hand.cookie, { path, samples: body });
+    expect(res.status, JSON.stringify(body)).toBe(400);
+  }
+  expect((await postMark(hand.cookie, { path, samples })).status).toBe(201);
+});
+
+it("streams the same samples in a live preview that the committed mark stores", async () => {
+  const stream = await openStream();
+  const hand = await freshHand();
+  const gesture = randomUUID();
+  const { samples, path } = sampledStroke((i) => (i % 4) / 4 + 0.1);
+  expect((await previewUpdate(hand.cookie, { gesture, from: 0, points: samples.slice(0, 5) })).status).toBe(200);
+  expect((await previewUpdate(hand.cookie, { gesture, from: 5, points: samples.slice(5) })).status).toBe(200);
+  await stream.next("preview", (d) => d.gesture === gesture && d.from === 5);
+  const streamed = stream.seen
+    .filter((e) => e.event === "preview" && e.data.gesture === gesture)
+    .flatMap((e) => e.data.points);
+  expect(streamed).toEqual(samples);
+
+  expect((await postMark(hand.cookie, { path, samples, gesture })).status).toBe(201);
+  const mark = await stream.next("mark", (d) => d.gesture === gesture);
+  expect(mark.samples).toEqual(streamed);
+  stream.close();
+});
+
+it("refuses a live preview whose samples are out of range, run backwards or change format", async () => {
+  const hand = await freshHand();
+  const bad = [
+    [[1, 1, 2, 0]], // pressure over 1
+    [[1, 1, 0.5, 5]], // the first sample isn't t = 0
+    [[1, 1, 0.5, 0], [2, 2, 0.5, -1]], // backwards
+    [[1, 1, 0.5, 0], [2, 2]], // mixed formats in one update
+  ];
+  for (const points of bad) {
+    expect((await previewUpdate(hand.cookie, { gesture: randomUUID(), from: 0, points })).status).toBe(400);
+  }
+  // Across updates too: the next one can't start before the last one ended,
+  // or switch to bare coordinates.
+  const gesture = randomUUID();
+  expect((await previewUpdate(hand.cookie, { gesture, from: 0, points: [[1, 1, 0.5, 0], [2, 2, 0.5, 40]] })).status).toBe(200);
+  expect((await previewUpdate(hand.cookie, { gesture, from: 2, points: [[3, 3, 0.5, 30]] })).status).toBe(400);
+  expect((await previewUpdate(hand.cookie, { gesture, from: 2, points: [[3, 3]] })).status).toBe(400);
+  expect((await previewUpdate(hand.cookie, { gesture, from: 2, points: [[3, 3, null, 40]] })).status).toBe(200);
+  await previewCancel(hand.cookie, gesture);
 });

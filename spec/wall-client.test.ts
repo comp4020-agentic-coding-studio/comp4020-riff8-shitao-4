@@ -138,13 +138,15 @@ function buildWall({
   if (liveMode && canDraw) $("mode").click();
   const publish = () => $("draft").dispatchEvent(new window.Event("submit", { cancelable: true }));
 
-  const gesture = (x: number, y: number, type: string, pointerType = "mouse") =>
+  // A mouse reports 0.5 while its button is down, whatever the hand does.
+  const gesture = (x: number, y: number, type: string, pointerType = "mouse", pressure = 0.5) =>
     svg.dispatchEvent(
       new window.PointerEvent(type, {
         clientX: x,
         clientY: y,
         pointerId: 1,
         pointerType,
+        pressure,
         bubbles: true,
       }),
     );
@@ -818,4 +820,99 @@ it("stops sending, and says the draft is private again, once the server refuses 
   await flushPreviews();
   expect(previews.length).toBe(1);
   expect($("draft-audience").textContent).toBe("Only you can see it.");
+});
+
+// --- Samples: pressure and timing, and the width they draw ---------------------
+
+// The outline's width at each sample (see spec/wall.test.ts's twin).
+const outlineWidths = (d: string, n: number) => {
+  const pts = [...d.matchAll(/(?:[ML]|0 0 0 )(-?[\d.]+),(-?[\d.]+)/g)].map((m) => [Number(m[1]), Number(m[2])]);
+  const [left, right] = [pts.slice(0, n), pts.slice(n, 2 * n).reverse()];
+  return left.map(([x, y], i) => Math.hypot(x - right[i][0], y - right[i][1]));
+};
+
+it("records a pen's pressure and timing for every point, and draws the stroke wider where it pressed harder", async () => {
+  const { gesture, posted, previews, svg, settle, flushPreviews, publish } = buildWall({ canDraw: true, autoPublish: false });
+  const pressures = [0.1, 0.3, 0.6, 0.9, 0.4];
+  gesture(100, 100, "pointerdown", "pen", pressures[0]);
+  for (let i = 1; i < pressures.length; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    gesture(100 + i * 40, 100, "pointermove", "pen", pressures[i]);
+  }
+  gesture(300, 100, "pointerup", "pen", 0);
+
+  // While it's drawn, the hand's own stroke already has its varying width.
+  const live = svg.querySelector("path.mine")!;
+  expect(live.classList.contains("inked")).toBe(true);
+  const widths = outlineWidths(live.getAttribute("d")!, pressures.length);
+  pressures.forEach((p, i) => expect(widths[i]).toBeCloseTo(12 * (p - 0.1), 0));
+
+  await flushPreviews();
+  publish();
+  await settle();
+  const samples = posted[0].samples as [number, number, number | null, number][];
+  expect(samples.map(([x, y]) => [x, y])).toEqual(pressures.map((_, i) => [100 + i * 40, 100]));
+  // Pressure as the device gave it (float32 noise trimmed to 4 places).
+  expect(samples.map((s) => s[2])).toEqual(pressures);
+  // Milliseconds since the first point: zero, then never running backwards,
+  // and nowhere near a clock time.
+  const times = samples.map((s) => s[3]);
+  expect(times[0]).toBe(0);
+  expect(times.every((t, i) => Number.isInteger(t) && (i === 0 || t >= times[i - 1]))).toBe(true);
+  expect(times.at(-1)).toBeGreaterThanOrEqual(15);
+  expect(times.at(-1)).toBeLessThan(10_000);
+  expect(posted[0].path).toBe("M100,100 L140,100 L180,100 L220,100 L260,100");
+  // The preview carried exactly what the mark did, point for point.
+  expect(previews.flatMap((p) => p.points as unknown[])).toEqual(samples);
+});
+
+it("draws a mouse stroke, whose pressure never changes, as the plain line it always was", async () => {
+  const { gesture, posted, svg, settle, publish } = buildWall({ canDraw: true });
+  gesture(10, 10, "pointerdown");
+  gesture(20, 30, "pointermove");
+  gesture(40, 30, "pointermove");
+  gesture(41, 31, "pointerup");
+  const mine = svg.querySelector("path.mine")!;
+  expect(mine.getAttribute("d")).toBe("M10,10 L20,30 L40,30");
+  expect(mine.classList.contains("inked")).toBe(false);
+  expect(mine.hasAttribute("fill")).toBe(false);
+  publish();
+  await settle();
+  // Still recorded, flat: the honest sign there was no real pressure.
+  expect((posted[0].samples as unknown[][]).map((s) => s[2])).toEqual([0.5, 0.5, 0.5]);
+});
+
+it("records no pressure at all for a keyboard gesture, rather than inventing one", async () => {
+  const { keyboardStroke, posted, settle } = buildWall({ canDraw: true });
+  keyboardStroke();
+  await settle();
+  expect(posted[0].samples).toMatchObject([
+    [500, 300, null, 0],
+    [530, 300, null, expect.any(Number)],
+  ]);
+});
+
+it("draws another hand's pressure stroke with its width, live and once committed", () => {
+  const { emitPreview, emitMark, previewPaths, svg } = buildWall({ canDraw: false });
+  const g = randomUUID();
+  const samples: [number, number, number, number][] = [
+    [10, 10, 0.2, 0],
+    [60, 10, 0.8, 30],
+    [110, 10, 0.2, 60],
+  ];
+  emitPreview({ gesture: g, from: 0, points: samples as unknown as Point[] });
+  const [preview] = previewPaths();
+  expect(preview.classList.contains("inked")).toBe(true);
+  expect(preview.getAttribute("fill")).toBe("#abcdef");
+  const previewD = preview.getAttribute("d");
+  emitMark({ id: 77, path: "M10,10 L60,10 L110,10", colour: "#abcdef", gesture: g, samples } as never);
+  const mark = svg.querySelector('[data-id="77"]')!;
+  // The same element, the same shape: it doesn't change character on landing.
+  expect(mark).toBe(preview);
+  expect(mark.getAttribute("d")).toBe(previewD);
+  expect(mark.classList.contains("inked")).toBe(true);
+  // A mark with no samples (from before they were recorded) stays plain.
+  emitMark({ id: 78, path: "M1,1 L2,2", colour: "#abcdef" });
+  const old = svg.querySelector('[data-id="78"]')!;
+  expect([old.getAttribute("d"), old.classList.contains("inked")]).toEqual(["M1,1 L2,2", false]);
 });

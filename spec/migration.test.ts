@@ -2,6 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { JSDOM } from "jsdom";
 import { expect, it, vi } from "vitest";
 
 // A database exactly as the live app left it before the sketchbook (the
@@ -51,6 +52,23 @@ it("keeps every existing mark, with the new fields empty", async () => {
   // And the new features work on it.
   expect(db.setNote("old-hand", 1, "from before the notes existed")).toBe(true);
   expect(db.ownMarks("old-hand")[0].note).toBe("from before the notes existed");
+});
+
+it("draws an old mark, which has no samples, exactly as it was drawn before them", async () => {
+  const db = await import("../src/db.ts");
+  const { keepsakeSvg, wallPage } = await import("../src/pages.ts");
+  const [mark] = db.allMarks();
+  const wall = new JSDOM(wallPage([mark], { id: "someone-else", colour: "#000" }, 0, 5000, "a prompt")).window.document;
+  const el = wall.querySelector('#wall path[data-id="1"]')!;
+  expect([el.getAttribute("d"), el.getAttribute("stroke"), el.getAttribute("class"), el.getAttribute("fill")]).toEqual(
+    ["M1,1 L2,2", "#cc4a28", null, null],
+  );
+  expect(keepsakeSvg(mark)).toContain(
+    '<path d="M1,1 L2,2" stroke="#cc4a28" fill="none" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" />',
+  );
+  // Nothing is made up for it: its samples stay empty in the database itself.
+  const raw = new DatabaseSync(dbPath).prepare("SELECT samples FROM marks WHERE id = 1").get();
+  expect(raw).toEqual({ samples: null });
 });
 
 it("is safe to run again on an already-migrated database", async () => {
