@@ -59,6 +59,19 @@
 
   const pathFrom = (pts) => pts.map(([x, y], i) => `${i === 0 ? "M" : "L"}${x},${y}`).join(" ");
 
+  // Draws `el` as a stroke: its pressure outline where the samples carry
+  // real pressure variation (ink.js, the same rule the server renders by),
+  // otherwise the plain path, exactly as strokes have always looked.
+  const ink = globalThis.TraceInk;
+  const shape = (el, samples, path) => {
+    const d = samples && ink ? ink.outline(samples) : null;
+    el.setAttribute("d", d ?? path ?? pathFrom(samples));
+    el.classList.toggle("inked", Boolean(d));
+    const colour = el.getAttribute("stroke");
+    if (d && colour) el.setAttribute("fill", colour);
+    else el.removeAttribute("fill");
+  };
+
   const makePath = (attrs) => {
     const p = document.createElementNS(SVG_NS, "path");
     for (const [k, v] of Object.entries(attrs)) if (v !== undefined) p.setAttribute(k, v);
@@ -69,8 +82,9 @@
   // own strokes and the one it's drawing right now, which stay on top.
   const insertUnderOwn = (el) => svg.insertBefore(el, svg.querySelector(".halo, .mine"));
 
-  const appendStroke = (path, colour, id, prompt) => {
-    const el = makePath({ d: path, stroke: colour, "data-id": id, "data-prompt": prompt ?? undefined });
+  const appendStroke = ({ path, samples, colour, id, prompt }) => {
+    const el = makePath({ stroke: colour, "data-id": id, "data-prompt": prompt ?? undefined });
+    shape(el, samples, path);
     insertUnderOwn(el);
     applyFilter(el);
   };
@@ -225,10 +239,25 @@
     if (publishButton) publishButton.disabled = !canPublish;
   };
 
-  const beginGesture = (point) => {
+  // Each point of a gesture is a sample, [x, y, pressure, t]: the pressure
+  // PointerEvent reports (null from a keyboard, which has none; a mouse or
+  // finger reports one constant value, kept as it is), and milliseconds
+  // since the gesture's first point --- never a clock time. Pressure is kept
+  // to four decimal places, finer than any width it could change.
+  let startedAt = 0;
+  const sample = ([x, y], evt, pressure) => {
+    const prev = points[points.length - 1];
+    const t = prev ? Math.max(prev[3], Math.round(evt.timeStamp - startedAt)) : 0;
+    const p = typeof pressure === "number" ? Math.round(pressure * 10_000) / 10_000 : null;
+    return [x, y, p, t];
+  };
+
+  const beginGesture = (point, evt, pressure) => {
     if (draft) discardDraft();
     drawing = true;
-    points = [point];
+    points = [];
+    startedAt = evt.timeStamp;
+    points.push(sample(point, evt, pressure));
     gesture = crypto.randomUUID();
     ownGestures.add(gesture);
     halo = makePath({ class: "halo" });
@@ -237,10 +266,10 @@
     if (liveMode && canPublish) startSender(gesture, points);
   };
 
-  const addPoint = (point) => {
-    points.push(point);
-    halo.setAttribute("d", pathFrom(points));
-    live.setAttribute("d", pathFrom(points));
+  const addPoint = (point, evt, pressure) => {
+    points.push(sample(point, evt, pressure));
+    shape(halo, points);
+    shape(live, points);
     schedule(sender);
   };
 
@@ -298,6 +327,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           path: pathFrom(pts),
+          samples: pts,
           gesture: committing,
           nonce,
           prompt: answers?.checked ? todayPrompt : undefined,
@@ -348,13 +378,13 @@
   svg.addEventListener("pointerdown", (evt) => {
     // A second finger mid-stroke is ignored rather than orphaning the first.
     if (submitting || drawing) return;
-    beginGesture(toViewBox(evt));
+    beginGesture(toViewBox(evt), evt, evt.pressure);
     svg.setPointerCapture(evt.pointerId);
   });
 
   svg.addEventListener("pointermove", (evt) => {
     if (!drawing) return;
-    addPoint(toViewBox(evt));
+    addPoint(toViewBox(evt), evt, evt.pressure);
   });
 
   svg.addEventListener("pointerup", finish);
@@ -389,14 +419,14 @@
       if (evt.key !== "Enter" && evt.key !== " ") return;
       evt.preventDefault();
       const vb = svg.viewBox.baseVal;
-      beginGesture([Math.round(vb.x + vb.width / 2), Math.round(vb.y + vb.height / 2)]);
+      beginGesture([Math.round(vb.x + vb.width / 2), Math.round(vb.y + vb.height / 2)], evt, null);
       return;
     }
     if (evt.key in ARROW_DELTAS) {
       evt.preventDefault();
       const [dx, dy] = ARROW_DELTAS[evt.key];
       const [x, y] = points[points.length - 1];
-      addPoint([x + dx, y + dy]);
+      addPoint([x + dx, y + dy], evt, null);
       return;
     }
     if (evt.key === "Enter" || evt.key === " ") {
@@ -483,7 +513,7 @@
     // Overlap from a retried update is dropped; a gap (an update this tab
     // somehow missed) still draws, joined straight across.
     r.points.push(...(from <= r.points.length ? pts.slice(r.points.length - from) : pts));
-    r.el.setAttribute("d", pathFrom(r.points));
+    shape(r.el, r.points);
     r.el.classList.toggle("held", Boolean(held));
     // The server sweeps abandoned previews and says so; this is the backstop
     // if that event itself never arrives.
@@ -506,13 +536,13 @@
       clearTimeout(r.timer);
       remote.delete(mark.gesture);
       r.el.classList.remove("preview", "held");
-      r.el.setAttribute("d", mark.path);
+      shape(r.el, mark.samples, mark.path);
       r.el.setAttribute("data-id", mark.id);
       if (mark.prompt) r.el.setAttribute("data-prompt", mark.prompt);
       applyFilter(r.el);
       describeLive();
     } else {
-      appendStroke(mark.path, mark.colour, mark.id, mark.prompt);
+      appendStroke(mark);
     }
     rememberSeen(mark.id);
     if (mark.gesture) markEnded(mark.gesture);
@@ -543,17 +573,19 @@
         // On top of everyone else's, but still under a stroke in progress.
         const inProgress = halo?.isConnected && !halo.hasAttribute("data-id") ? halo : null;
         const stroke = makePath({
-          d: m.path,
           stroke: m.colour,
           class: "mine",
           "data-id": m.id,
           "data-prompt": m.prompt ?? undefined,
         });
-        svg.insertBefore(makePath({ d: m.path, class: "halo", "data-id": m.id }), inProgress);
+        const strokeHalo = makePath({ class: "halo", "data-id": m.id });
+        shape(stroke, m.samples, m.path);
+        shape(strokeHalo, m.samples, m.path);
+        svg.insertBefore(strokeHalo, inProgress);
         svg.insertBefore(stroke, inProgress);
         applyFilter(stroke);
       } else {
-        appendStroke(m.path, m.colour, m.id, m.prompt);
+        appendStroke(m);
       }
     }
   };

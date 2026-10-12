@@ -13,10 +13,13 @@ import { wallPage } from "../src/pages.ts";
 // drives it with synthetic pointer events instead, with fetch/EventSource
 // stubbed since there's no server here.
 const wallSource = readFileSync("public/wall.js", "utf8");
+const inkSource = readFileSync("public/ink.js", "utf8");
 
 type Body = Record<string, unknown>;
 const TODAY = "a shadow you noticed";
 type Point = [number, number];
+// Just the coordinates of the samples a tab streamed, for tests about order.
+const coords = (updates: Body[]) => updates.flatMap((p) => (p.points as number[][]).map(([x, y]) => [x, y]));
 
 function buildWall({
   canDraw,
@@ -55,7 +58,7 @@ function buildWall({
     canDraw ? 0 : 3_600_000 * 5,
     previewLease,
     TODAY,
-  ).replace(/<script[\s\S]*?<\/script>/, "");
+  ).replace(/<script[\s\S]*?<\/script>/g, "");
   const dom = new JSDOM(html, { runScripts: "dangerously", url: "http://localhost/" });
   if (lastSeen !== undefined) dom.window.localStorage.setItem("trace:last-seen", String(lastSeen));
   const { window } = dom;
@@ -120,6 +123,10 @@ function buildWall({
     }
   };
 
+  // The page loads ink.js (the shared width rule) before wall.js.
+  const ink = window.document.createElement("script");
+  ink.textContent = inkSource;
+  window.document.body.appendChild(ink);
   const script = window.document.createElement("script");
   script.dataset.handColour = "#123456";
   script.dataset.canDraw = String(canDraw);
@@ -351,8 +358,7 @@ it("streams a pointer gesture as a preview while it's drawn, then commits under 
   const id = previews[0].gesture;
   expect(previews.every((p) => p.gesture === id)).toBe(true);
   // Coalesced and in order: each update starts where the last one ended.
-  const sent = previews.flatMap((p) => p.points as Point[]);
-  expect(sent).toEqual([[10, 10], [20, 20], [30, 30], [40, 40]]);
+  expect(coords(previews)).toEqual([[10, 10], [20, 20], [30, 30], [40, 40]]);
   expect(previews.every((p) => !("nonce" in p) && !("colour" in p))).toBe(true);
 
   gesture(41, 41, "pointerup");
@@ -479,7 +485,7 @@ it("streams a keyboard gesture too, and Escape cancels its preview", async () =>
   key("Enter");
   key("ArrowRight");
   await flushPreviews();
-  expect(previews.flatMap((p) => p.points as Point[])).toEqual([[500, 300], [530, 300]]);
+  expect(coords(previews)).toEqual([[500, 300], [530, 300]]);
   key("Escape");
   await settle();
   expect(cancels.map((c) => c.gesture)).toEqual([previews[0].gesture]);
@@ -681,6 +687,7 @@ const markRow = (id: number, prompt: string | null, hand = "someone-else"): Mark
   colour: "#cc4a28",
   created_at: id,
   prompt,
+  samples: null,
 });
 
 it("points out marks that are new since this browser last looked", () => {
@@ -737,8 +744,7 @@ it("on a slow connection, coalesces a burst of movement into a few ordered updat
   await new Promise((resolve) => setTimeout(resolve, 900));
   // One request in flight at a time: about one per round trip, not one per move.
   expect(previews.length).toBeLessThanOrEqual(5);
-  const sent = previews.flatMap((p) => p.points as Point[]);
-  expect(sent).toEqual(Array.from({ length: 61 }, (_, i) => [i, i]));
+  expect(coords(previews)).toEqual(Array.from({ length: 61 }, (_, i) => [i, i]));
   expect(previews.every((p, i) => i === 0 || (p.from as number) >= (previews[i - 1].from as number))).toBe(true);
   expect($("mode-note").textContent).not.toContain("only on your screen");
 });

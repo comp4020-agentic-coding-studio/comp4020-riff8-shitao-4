@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import type { Sample } from "./ink.ts";
 
 export interface Hand {
   id: string;
@@ -18,6 +19,9 @@ export interface Mark {
   // The shared prompt a mark answered, as worded that day (null if the hand
   // chose not to answer it, or the mark predates prompts).
   prompt: string | null;
+  // How the stroke was drawn, point by point (null for marks made before
+  // samples were recorded: none is ever made up for them).
+  samples: Sample[] | null;
 }
 
 // What only the hand that drew a mark ever sees.
@@ -60,6 +64,8 @@ if (!markColumns.has("deleted_at")) db.exec("ALTER TABLE marks ADD COLUMN delete
 // finds the mark it already made instead of making another. Never sent to
 // any page.
 if (!markColumns.has("nonce")) db.exec("ALTER TABLE marks ADD COLUMN nonce TEXT");
+// The stroke's samples as JSON text, one [x, y, pressure, t] per path point.
+if (!markColumns.has("samples")) db.exec("ALTER TABLE marks ADD COLUMN samples TEXT");
 db.exec(`
   CREATE UNIQUE INDEX IF NOT EXISTS marks_hand_nonce ON marks (hand_id, nonce) WHERE nonce IS NOT NULL;
   CREATE TABLE IF NOT EXISTS notes (
@@ -69,14 +75,14 @@ db.exec(`
   );
 `);
 
-const MARK_FIELDS = "id, hand_id, path, colour, created_at, prompt";
+const MARK_FIELDS = "id, hand_id, path, colour, created_at, prompt, samples";
 
 const insertHandStmt = db.prepare(
   "INSERT INTO hands (id, name, colour, created_at) VALUES (?, ?, ?, ?)",
 );
 const getHandStmt = db.prepare("SELECT * FROM hands WHERE id = ?");
 const insertMarkStmt = db.prepare(
-  "INSERT INTO marks (hand_id, path, colour, created_at, prompt, nonce) VALUES (?, ?, ?, ?, ?, ?)",
+  "INSERT INTO marks (hand_id, path, colour, created_at, prompt, nonce, samples) VALUES (?, ?, ?, ?, ?, ?, ?)",
 );
 const allMarksStmt = db.prepare(
   `SELECT ${MARK_FIELDS} FROM marks WHERE deleted_at IS NULL ORDER BY created_at ASC`,
@@ -100,8 +106,12 @@ const upsertNoteStmt = db.prepare(
 );
 const deleteNoteStmt = db.prepare("DELETE FROM notes WHERE mark_id = ?");
 const deleteMarkStmt = db.prepare(
-  "UPDATE marks SET path = '', prompt = NULL, nonce = NULL, deleted_at = ? WHERE id = ?",
+  "UPDATE marks SET path = '', prompt = NULL, nonce = NULL, samples = NULL, deleted_at = ? WHERE id = ?",
 );
+
+type Row<T extends Mark> = Omit<T, "samples"> & { samples: string | null };
+const parse = <T extends Mark>(row: Row<T>): T =>
+  ({ ...row, samples: row.samples === null ? null : JSON.parse(row.samples) }) as T;
 
 export function getHand(id: string): Hand | undefined {
   return getHandStmt.get(id) as unknown as Hand | undefined;
@@ -114,7 +124,7 @@ export function createHand(id: string, name: string, colour: string): Hand {
 }
 
 export function allMarks(): Mark[] {
-  return allMarksStmt.all() as unknown as Mark[];
+  return (allMarksStmt.all() as unknown as Row<Mark>[]).map(parse);
 }
 
 // "A day" is the 24 hours since a hand's last mark, not a calendar day: any
@@ -133,18 +143,31 @@ export function addMark(
   path: string,
   colour: string,
   created_at = Date.now(),
-  { prompt = null, nonce = null }: { prompt?: string | null; nonce?: string | null } = {},
+  {
+    prompt = null,
+    nonce = null,
+    samples = null,
+  }: { prompt?: string | null; nonce?: string | null; samples?: Sample[] | null } = {},
 ): Mark {
-  const result = insertMarkStmt.run(handId, path, colour, created_at, prompt, nonce);
-  return { id: Number(result.lastInsertRowid), hand_id: handId, path, colour, created_at, prompt };
+  const result = insertMarkStmt.run(
+    handId,
+    path,
+    colour,
+    created_at,
+    prompt,
+    nonce,
+    samples === null ? null : JSON.stringify(samples),
+  );
+  return { id: Number(result.lastInsertRowid), hand_id: handId, path, colour, created_at, prompt, samples };
 }
 
 export function markByNonce(handId: string, nonce: string): Mark | undefined {
-  return markByNonceStmt.get(handId, nonce) as unknown as Mark | undefined;
+  const row = markByNonceStmt.get(handId, nonce) as unknown as Row<Mark> | undefined;
+  return row && parse(row);
 }
 
 export function ownMarks(handId: string): OwnMark[] {
-  return ownMarksStmt.all(handId) as unknown as OwnMark[];
+  return (ownMarksStmt.all(handId) as unknown as Row<OwnMark>[]).map(parse);
 }
 
 const owns = (handId: string, markId: number) => ownsMarkStmt.get(markId, handId) !== undefined;

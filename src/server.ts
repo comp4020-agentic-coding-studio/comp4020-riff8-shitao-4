@@ -13,7 +13,8 @@ import {
   ownMarks,
   setNote,
 } from "./db.ts";
-import { createLive, type LiveEvent } from "./live.ts";
+import { endpoints, pathPoints, type Sample } from "./ink.ts";
+import { createLive, samplesMatch, type LiveEvent } from "./live.ts";
 import { colourFor, nameFor, newHandId, parseHandCookie, setHandCookie } from "./identity.ts";
 import { keepsakeSvg, minePage, readmePage, untilPhrase, wallPage } from "./pages.ts";
 import { isPrompt, promptFor } from "./prompts.ts";
@@ -105,23 +106,23 @@ function broadcastLive(events: LiveEvent[]): void {
   for (const { type, ...data } of events) send(type, data);
 }
 
+// A committed mark as anyone may read it, on /api/marks and the stream: the
+// stroke, how it was drawn and where it began and ended, never which hand
+// drew it.
+const publicMark = (m: { id: number; path: string; colour: string; prompt: string | null; samples: Sample[] | null }) => ({
+  id: m.id,
+  path: m.path,
+  colour: m.colour,
+  prompt: m.prompt,
+  samples: m.samples,
+  ...endpoints(m.path),
+});
+
 // The gesture id lets viewers swap a preview for its committed stroke in
 // place. Nothing a tab sends to prove who it is (the cookie, a submission
 // nonce) ever goes out over this stream.
-function broadcastMark(mark: {
-  id: number;
-  path: string;
-  colour: string;
-  prompt: string | null;
-  gesture?: string;
-}): void {
-  send("mark", {
-    id: mark.id,
-    path: mark.path,
-    colour: mark.colour,
-    prompt: mark.prompt,
-    gesture: mark.gesture,
-  });
+function broadcastMark(mark: Parameters<typeof publicMark>[0] & { gesture?: string }): void {
+  send("mark", { ...publicMark(mark), gesture: mark.gesture });
 }
 
 setInterval(() => broadcastLive(live.sweep()), 1000).unref();
@@ -186,13 +187,7 @@ const server = createServer(async (req, res) => {
       json(
         res,
         200,
-        allMarks().map((m) => ({
-          id: m.id,
-          path: m.path,
-          colour: m.colour,
-          prompt: m.prompt,
-          mine: m.hand_id === handId,
-        })),
+        allMarks().map((m) => ({ ...publicMark(m), mine: m.hand_id === handId })),
       );
       return;
     }
@@ -205,7 +200,8 @@ const server = createServer(async (req, res) => {
       }
       let body: Record<string, unknown>;
       try {
-        body = JSON.parse(await readBody(req, 8_000)) as Record<string, unknown>;
+        // 200 samples, with room for pressure sent at full float precision.
+        body = JSON.parse(await readBody(req, 16_000)) as Record<string, unknown>;
         if (typeof body !== "object" || body === null) throw new Error("not an object");
       } catch {
         json(res, 400, { error: "Malformed request." });
@@ -234,7 +230,10 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    if (req.method === "GET" && (url.pathname === "/style.css" || url.pathname === "/wall.js")) {
+    if (
+      req.method === "GET" &&
+      (url.pathname === "/style.css" || url.pathname === "/wall.js" || url.pathname === "/ink.js")
+    ) {
       const filePath = join("public", url.pathname);
       const type = STATIC_TYPES[extname(filePath)] ?? "application/octet-stream";
       res.writeHead(200, { "Content-Type": type, "Cache-Control": "no-cache" });
@@ -245,8 +244,16 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/api/marks") {
       const hand = ensureHand(req, res);
 
-      const raw = await readBody(req);
-      let body: { path?: unknown; gesture?: unknown; nonce?: unknown; prompt?: unknown; note?: unknown };
+      // A 2000-point path plus a sample for every point.
+      const raw = await readBody(req, 200_000);
+      let body: {
+        path?: unknown;
+        samples?: unknown;
+        gesture?: unknown;
+        nonce?: unknown;
+        prompt?: unknown;
+        note?: unknown;
+      };
       try {
         body = JSON.parse(raw);
         if (typeof body !== "object" || body === null) throw new Error("not an object");
@@ -265,6 +272,16 @@ const server = createServer(async (req, res) => {
         res.end("That doesn't look like a mark.");
         return;
       }
+      // Optional, so a tab loaded before samples existed can still add its
+      // mark (stored without them, drawn as before); but sent at all, they
+      // must describe exactly this path.
+      if (body.samples !== undefined && !samplesMatch(body.samples, pathPoints(path))) {
+        broadcastLive(live.cancel(hand.id, gesture));
+        res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end("That stroke's samples don't match its path.");
+        return;
+      }
+      const samples = (body.samples as Sample[] | undefined) ?? null;
       if (body.note !== undefined && (typeof body.note !== "string" || body.note.length > NOTE_MAX)) {
         broadcastLive(live.cancel(hand.id, gesture));
         res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
@@ -295,7 +312,7 @@ const server = createServer(async (req, res) => {
         return;
       }
 
-      const mark = addMark(hand.id, path, hand.colour, Date.now(), { prompt, nonce });
+      const mark = addMark(hand.id, path, hand.colour, Date.now(), { prompt, nonce, samples });
       if (typeof body.note === "string") setNote(hand.id, mark.id, body.note);
       broadcastMark({ ...mark, gesture: live.commit(hand.id, gesture) });
       json(res, 201, { id: mark.id, nextAt: mark.created_at + MARK_INTERVAL_MS });
@@ -320,6 +337,8 @@ const server = createServer(async (req, res) => {
         const marks = ownMarks(hand.id).map((m) => ({
           drawn_at: new Date(m.created_at).toISOString(),
           path: m.path,
+          ...endpoints(m.path),
+          samples: m.samples,
           colour: m.colour,
           prompt: m.prompt,
           note: m.note,

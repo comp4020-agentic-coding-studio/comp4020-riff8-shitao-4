@@ -1,5 +1,6 @@
 import { marked } from "marked";
 import type { Mark, OwnMark } from "./db.ts";
+import { inkFor } from "./ink.ts";
 
 const escape = (s: string): string =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -54,6 +55,21 @@ const nextAtTime = (msUntilNextMark: number): string => {
   return `<time id="next-at" datetime="${at.toISOString()}">from ${escape(exact)} Canberra time (${untilPhrase(msUntilNextMark)})</time>`;
 };
 
+// A mark's <path>: its pressure outline, filled in its colour, where its
+// samples carry real pressure variation (public/ink.js), otherwise the plain
+// centreline it has always been. A halo is the same shape in the background
+// colour, so it hugs a varying width too. CSS supplies widths and fills for
+// the wall and thumbnails; `standalone` (the keepsake, with no stylesheet)
+// sets its own fill.
+function inkedPath(m: Mark, classes: string[], attrs: string, standalone = false): string {
+  const { d, inked } = inkFor(m);
+  const cls = inked ? [...classes, "inked"] : classes;
+  const halo = classes.includes("halo");
+  const paint = halo ? "" : ` stroke="${escape(m.colour)}"`;
+  const fill = halo ? "" : inked ? ` fill="${escape(m.colour)}"` : standalone ? ` fill="none"` : "";
+  return `<path d="${escape(d)}"${cls.length ? ` class="${cls.join(" ")}"` : ""}${paint}${fill}${attrs ? ` ${attrs}` : ""} />`;
+}
+
 export function wallPage(
   marks: Mark[],
   hand: { id: string; colour: string },
@@ -72,13 +88,10 @@ export function wallPage(
   const strokes = [
     ...marks
       .filter((m) => m.hand_id !== hand.id)
-      .map(
-        (m) =>
-          `<path d="${escape(m.path)}" stroke="${escape(m.colour)}" data-id="${m.id}"${promptAttr(m)} />`,
-      ),
+      .map((m) => inkedPath(m, [], `data-id="${m.id}"${promptAttr(m)}`)),
     ...own.flatMap((m) => [
-      `<path d="${escape(m.path)}" class="halo" data-id="${m.id}" />`,
-      `<path d="${escape(m.path)}" stroke="${escape(m.colour)}" class="mine" data-id="${m.id}"${promptAttr(m)} />`,
+      inkedPath(m, ["halo"], `data-id="${m.id}"`),
+      inkedPath(m, ["mine"], `data-id="${m.id}"${promptAttr(m)}`),
     ]),
   ].join("\n      ");
   const ownCount = own.length;
@@ -117,6 +130,7 @@ export function wallPage(
       <p id="fresh" hidden></p>
       <p><small>You draw as <strong style="color:${escape(handColour)}">this colour</strong>.${ownCount > 0 ? ` Your ${ownCount === 1 ? "mark is" : `${ownCount} marks are`} the thicker ${ownCount === 1 ? "stroke" : "strokes"}, and <a href="/mine/">My traces</a> keeps ${ownCount === 1 ? "it" : "them"} with your notes.` : ""}</small></p>
     </main>
+    <script src="/ink.js"></script>
     <script
       src="/wall.js"
       data-can-draw="${alreadyMarked ? "false" : "true"}"
@@ -128,7 +142,7 @@ export function wallPage(
 }
 
 const strokeSvg = (m: Mark, attrs: string): string =>
-  `<svg viewBox="0 0 1000 600" ${attrs}><path d="${escape(m.path)}" stroke="${escape(m.colour)}" /></svg>`;
+  `<svg viewBox="0 0 1000 600" ${attrs}>${inkedPath(m, [], "")}</svg>`;
 
 export function minePage(marks: OwnMark[], msUntilNextMark: number, flash = ""): string {
   const items = marks
@@ -188,7 +202,7 @@ export function keepsakeSvg(m: Mark): string {
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" width="1000" height="600">
   <title>${escape(title)}</title>
   <rect width="1000" height="600" fill="#ffffff" />
-  <path d="${escape(m.path)}" stroke="${escape(m.colour)}" stroke-width="6" fill="none" stroke-linecap="round" stroke-linejoin="round" />
+  ${inkedPath(m, [], `stroke-width="6" stroke-linecap="round" stroke-linejoin="round"`, true)}
 </svg>
 `;
 }

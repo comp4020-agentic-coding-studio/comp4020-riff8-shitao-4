@@ -123,8 +123,14 @@ button.danger {
   cursor: crosshair;
 }
 
-#wall path {
+/* A stroke with real pressure variation is an outline (public/ink.js) filled
+   by its own fill attribute; the stroke-width here still draws round it, so
+   its lightest point is exactly as wide as any other stroke. */
+#wall path:not(.inked) {
   fill: none;
+}
+
+#wall path {
   stroke-width: 4;
   stroke-linecap: round;
   stroke-linejoin: round;
@@ -153,6 +159,16 @@ button.danger {
 #wall path.halo {
   stroke: Canvas;
   stroke-width: 13;
+}
+
+#wall path.halo.inked {
+  fill: Canvas;
+}
+
+/* Not committed yet: a pressure stroke shows as its dashed outline, unfilled. */
+#wall path.inked.draft,
+#wall path.inked.preview.held {
+  fill: none;
 }
 
 #wall path.fresh {
@@ -236,8 +252,11 @@ textarea {
   border-radius: 0.375rem;
 }
 
-.thumb path {
+.thumb path:not(.inked) {
   fill: none;
+}
+
+.thumb path {
   stroke-width: 10;
   stroke-linecap: round;
   stroke-linejoin: round;

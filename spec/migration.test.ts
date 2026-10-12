@@ -35,7 +35,15 @@ process.env.DB_PATH = dbPath;
 it("keeps every existing mark, with the new fields empty", async () => {
   const db = await import("../src/db.ts");
   expect(db.allMarks()).toEqual([
-    { id: 1, hand_id: "old-hand", path: "M1,1 L2,2", colour: "#cc4a28", created_at: now - 1000, prompt: null },
+    {
+      id: 1,
+      hand_id: "old-hand",
+      path: "M1,1 L2,2",
+      colour: "#cc4a28",
+      created_at: now - 1000,
+      prompt: null,
+      samples: null,
+    },
   ]);
   expect(db.ownMarks("old-hand")).toMatchObject([{ id: 1, note: null }]);
   // The old mark still spends today's allowance.

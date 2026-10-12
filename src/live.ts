@@ -4,7 +4,11 @@
 // or simply goes quiet for longer than its lease. A restart forgets every
 // preview, which is the point: an unfinished gesture is never artwork.
 
-export type Point = [number, number];
+import type { Sample } from "./ink.ts";
+
+// A bare coordinate from a tab loaded before samples existed, or a sample
+// with its pressure and timing. One gesture uses one or the other throughout.
+export type Point = [number, number] | Sample;
 
 export interface PreviewSnapshot {
   gesture: string;
@@ -54,12 +58,43 @@ export const LIMITS = {
   // capture on; the viewBox itself is 1000 × 600.
   coordMin: -1000,
   coordMax: 2000,
+  // A sample's timestamp is milliseconds since the gesture's first point, and
+  // no preview outlives this (createLive's maxAgeMs), so no gesture can.
+  gestureMs: 10 * 60 * 1000,
 };
 
+const validCoord = (n: unknown) => Number.isInteger(n) && (n as number) >= LIMITS.coordMin && (n as number) <= LIMITS.coordMax;
+
+const validSample = (s: unknown): s is Sample =>
+  Array.isArray(s) &&
+  s.length === 4 &&
+  validCoord(s[0]) &&
+  validCoord(s[1]) &&
+  (s[2] === null || (typeof s[2] === "number" && s[2] >= 0 && s[2] <= 1)) &&
+  Number.isInteger(s[3]) &&
+  s[3] >= 0 &&
+  s[3] <= LIMITS.gestureMs;
+
 const validPoint = (p: unknown): p is Point =>
-  Array.isArray(p) &&
-  p.length === 2 &&
-  p.every((n) => Number.isInteger(n) && n >= LIMITS.coordMin && n <= LIMITS.coordMax);
+  validSample(p) || (Array.isArray(p) && p.length === 2 && p.every(validCoord));
+
+// Timestamps never run backwards, from `after` (the previous sample's) on.
+const inOrder = (samples: Sample[], after = 0) =>
+  samples.every((s, i) => s[3] >= (i === 0 ? after : samples[i - 1][3]));
+
+// A finished mark's samples, checked against the path it was submitted with:
+// one per path point, at exactly that point, starting at t = 0, in order,
+// each in range. Anything else is refused, never repaired.
+export function samplesMatch(samples: unknown, path: [number, number][]): samples is Sample[] {
+  return (
+    Array.isArray(samples) &&
+    samples.length === path.length &&
+    samples.every(validSample) &&
+    samples[0][3] === 0 &&
+    inOrder(samples) &&
+    samples.every((s, i) => s[0] === path[i][0] && s[1] === path[i][1])
+  );
+}
 
 // A finished stroke waiting on its hand's decision is shown dashed, kept
 // alive by heartbeats --- but not forever: after heldMaxMs it's swept like
@@ -69,7 +104,7 @@ const validPoint = (p: unknown): p is Point =>
 export function createLive({
   leaseMs,
   heldMaxMs = 120_000,
-  maxAgeMs = 10 * 60 * 1000,
+  maxAgeMs = LIMITS.gestureMs,
 }: {
   leaseMs: number;
   heldMaxMs?: number;
@@ -114,6 +149,13 @@ export function createLive({
       ) {
         return { ok: false, status: 400, reason: "bad points" };
       }
+      const pts = points as Point[];
+      if (!pts.every((p) => p.length === pts[0].length)) {
+        return { ok: false, status: 400, reason: "bad points" };
+      }
+      if (pts[0]?.length === 4 && (!inOrder(pts as Sample[]) || (from === 0 && (pts[0] as Sample)[3] !== 0))) {
+        return { ok: false, status: 400, reason: "bad timestamps" };
+      }
       const held = body.held === true;
 
       const endedEntry = ended.get(gesture);
@@ -155,6 +197,13 @@ export function createLive({
       const fresh = (points as Point[]).slice(count - start);
       if (count + fresh.length > LIMITS.pointsPerGesture) {
         return { ok: false, status: 413, reason: "stroke too long", count };
+      }
+      const last = preview.points.at(-1);
+      if (last && fresh.length > 0) {
+        if (fresh[0].length !== last.length) return { ok: false, status: 400, reason: "bad points", count };
+        if (last.length === 4 && (fresh[0] as Sample)[3] < last[3]) {
+          return { ok: false, status: 400, reason: "bad timestamps", count };
+        }
       }
       preview.points.push(...fresh);
       preview.updatedAt = now;
