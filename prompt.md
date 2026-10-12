@@ -81,9 +81,14 @@ database.
 Extend `src/db.ts`'s `marks` table the way earlier columns were added:
 `ALTER TABLE ... ADD COLUMN`, checked against `PRAGMA table_info` before
 running, never a table rebuild, so a redeploy onto the existing Fly
-volume loses nothing. Store the sample list as JSON in a new column (for
-example `samples`). **Do not fabricate samples for marks that predate
-this change** — leave the column `NULL` for them rather than inventing
+volume loses nothing. Store the sample list as **JSON text** in a new
+column (for example `samples`) — this app's API, SSE stream and export
+are JSON throughout (`/api/marks`, `/api/marks/stream`,
+`/mine/export.json`); don't introduce CSV or any other serialisation for
+this one column. Each row's samples belong to that row, so they're
+already tied to its existing `hand_id` the same way `path` and `colour`
+are — no new "who drew this" field is needed or wanted. **Do not
+fabricate samples for marks that predate this change** — leave the column `NULL` for them rather than inventing
 plausible-looking pressure or timing data that was never actually
 captured; have rendering fall back to the current fixed appearance
 whenever samples are absent. Extend `spec/migration.test.ts` to prove an
@@ -110,6 +115,16 @@ detail honestly, and don't let per-point timing become a new privacy
 surface (relative-to-gesture only, never wall-clock per point, never
 exposed per-hand across marks in a way that didn't already exist via
 `created_at`).
+
+`hand_id` already records which anonymous hand drew a mark, and that's
+enough: it's used server-side for the daily limit, ownership and My
+traces, and it stays exactly that internal — never added to `/api/marks`,
+the SSE `mark` event, the wall HTML, or any response a different hand can
+read. Samples, width and start/end ride on the same row and inherit that
+same boundary; don't introduce any new way for one hand's marks to be
+grouped or identified by another visitor. Surfacing who drew what would
+reverse the "no way to find out who drew which mark unless they tell you"
+design in `README.md` and is explicitly out of scope here.
 
 ## Verification and completion
 
