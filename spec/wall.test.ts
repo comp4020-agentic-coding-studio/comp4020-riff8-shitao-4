@@ -780,3 +780,14 @@ it("refuses a live preview whose samples are out of range, run backwards or chan
   expect((await previewUpdate(hand.cookie, { gesture, from: 2, points: [[3, 3, null, 40]] })).status).toBe(200);
   await previewCancel(hand.cookie, gesture);
 });
+
+it("reads where a stroke began and ended from any path the server accepts", async () => {
+  const hand = await freshHand();
+  const x = 100 + (Date.now() % 700);
+  // PATH_RE takes any whitespace before an L, not just a space.
+  const post = await postMark(hand.cookie, { path: `M${x},20\nL30,40\tL50,60` });
+  expect(post.status).toBe(201);
+  const { id } = await post.json();
+  const listed = ((await (await fetch(new URL("/api/marks", baseUrl))).json()) as any[]).find((m) => m.id === id);
+  expect([listed.start, listed.end]).toEqual([[x, 20], [50, 60]]);
+});

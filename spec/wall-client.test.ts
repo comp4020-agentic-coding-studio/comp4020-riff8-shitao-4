@@ -916,3 +916,31 @@ it("draws another hand's pressure stroke with its width, live and once committed
   const old = svg.querySelector('[data-id="78"]')!;
   expect([old.getAttribute("d"), old.classList.contains("inked")]).toEqual(["M1,1 L2,2", false]);
 });
+
+it("ends a gesture at ten minutes, as if lifted, rather than making a draft the server would refuse", async () => {
+  const { window, svg, gesture, posted, settle, publish, $ } = buildWall({ canDraw: true });
+  const pointer = (x: number, type: string, at?: number) => {
+    const evt = new window.PointerEvent(type, { clientX: x, clientY: x, pointerId: 1, pressure: 0.5, bubbles: true });
+    if (at !== undefined) Object.defineProperty(evt, "timeStamp", { value: at });
+    svg.dispatchEvent(evt);
+    return evt.timeStamp;
+  };
+  const t0 = pointer(10, "pointerdown");
+  pointer(20, "pointermove", t0 + 1000);
+  pointer(30, "pointermove", t0 + 10 * 60 * 1000 + 1);
+  expect($("draft").hidden).toBe(false);
+  gesture(40, 40, "pointermove"); // ignored: the gesture is over
+  gesture(41, 41, "pointerup");
+  publish();
+  await settle();
+  expect(posted[0].path).toBe("M10,10 L20,20");
+  expect((posted[0].samples as number[][]).every((s) => s[3] <= 10 * 60 * 1000)).toBe(true);
+});
+
+it("draws a pen pressed and held in one spot as a dot, not half a disc", () => {
+  const { gesture, svg } = buildWall({ canDraw: true, autoPublish: false });
+  gesture(50, 50, "pointerdown", "pen", 0.2);
+  gesture(50, 50, "pointermove", "pen", 0.9);
+  const mine = svg.querySelector("path.mine")!;
+  expect([mine.getAttribute("d"), mine.classList.contains("inked")]).toEqual(["M50,50 L50,50", false]);
+});

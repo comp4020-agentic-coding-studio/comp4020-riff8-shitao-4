@@ -22,7 +22,7 @@ export function inkFor(m: { path: string; samples: Sample[] | null }): { d: stri
 export const pathPoints = (path: string): [number, number][] =>
   path
     .slice(1)
-    .split(" L")
+    .split(/\sL/)
     .map((p) => p.split(",").map(Number) as [number, number]);
 
 // Where a stroke began and ended. Read from the path, which a mark's samples

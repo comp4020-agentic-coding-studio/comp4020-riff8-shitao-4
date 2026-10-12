@@ -266,8 +266,18 @@
     if (liveMode && canPublish) startSender(gesture, points);
   };
 
+  // The server refuses a sample timed past this (src/live.ts's
+  // LIMITS.gestureMs), so a gesture that runs this long ends here instead,
+  // as if the hand had lifted, rather than becoming a draft it can't add.
+  const MAX_GESTURE_MS = 10 * 60 * 1000;
+
   const addPoint = (point, evt, pressure) => {
-    points.push(sample(point, evt, pressure));
+    const next = sample(point, evt, pressure);
+    if (next[3] > MAX_GESTURE_MS) {
+      finish();
+      return;
+    }
+    points.push(next);
     shape(halo, points);
     shape(live, points);
     schedule(sender);

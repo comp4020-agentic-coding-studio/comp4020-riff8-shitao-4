@@ -15,6 +15,8 @@
 // rather than having its noise stretched into a taper, and a mouse or finger
 // (which reports one constant value) gets no outline at all: `outline`
 // returns null and the caller draws the plain centreline path, as before.
+// Since the lightest point isn't known until the stroke ends, a stroke still
+// being drawn widens all along if a later point is lighter than any before.
 globalThis.TraceInk = (() => {
   const EXTRA = 12;
   const round = (n) => Math.round(n * 10) / 10;
@@ -43,15 +45,22 @@ globalThis.TraceInk = (() => {
     const left = [];
     const right = [];
     const half = samples.map((s) => (EXTRA * (s[2] - min)) / 2);
-    let nx = 0;
-    let ny = 1;
-    for (let i = 0; i < n; i++) {
+    const tangent = (i) => {
       const a = samples[Math.max(0, i - 1)];
       const b = samples[Math.min(n - 1, i + 1)];
-      const tx = b[0] - a[0];
-      const ty = b[1] - a[1];
+      return [b[0] - a[0], b[1] - a[1]];
+    };
+    // A pen pressed in one spot has no direction to be wide across: it
+    // draws as the plain path's round dot.
+    const first = samples.findIndex((_, i) => tangent(i).some((v) => v !== 0));
+    if (first === -1) return null;
+    let nx = 0;
+    let ny = 0;
+    for (let i = 0; i < n; i++) {
+      // A repeated point has no direction of its own: take the nearest
+      // one's, the stroke's first direction for any repeats it starts with.
+      const [tx, ty] = tangent(Math.max(i, first));
       const len = Math.hypot(tx, ty);
-      // A repeated point has no direction of its own: keep the last one.
       if (len > 0) {
         nx = -ty / len;
         ny = tx / len;
